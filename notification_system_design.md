@@ -2166,3 +2166,434 @@ This combination provides the best balance of performance, scalability, cost, an
 - Efficient API design prevents unnecessary database and network work.
 
 Together, these strategies allow the notification platform to support 50,000 students and millions of notifications while maintaining fast response times and predictable operational behavior.
+
+# Stage 5
+
+## Review of Existing Implementation
+
+### Existing Pseudocode
+
+```text
+function notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+### Shortcomings
+
+#### Sequential Processing
+
+The implementation processes students one at a time. For 50,000 students, the total execution time is the sum of every email send, database write, and app push operation.
+
+If each student takes even 100 milliseconds to process, the total runtime can become more than 80 minutes.
+
+#### Poor Scalability
+
+The function runs as a single sequential workflow. It cannot efficiently use multiple workers, servers, or queues to distribute work.
+
+As the number of students grows, latency grows linearly.
+
+#### Tight Coupling
+
+Email delivery, database persistence, and app push delivery are tightly coupled in the same loop.
+
+This creates several problems:
+
+- A failure in email delivery can block database persistence.
+- A failure in push delivery can affect email delivery.
+- Delivery channels cannot scale independently.
+- New channels, such as SMS or WhatsApp, require changing the same core function.
+
+#### No Fault Tolerance
+
+If the process crashes halfway through the loop, the system has no reliable way to know which students were fully processed, partially processed, or not processed at all.
+
+#### No Retries
+
+Transient failures such as email provider timeouts, network errors, or push gateway throttling are not retried.
+
+Temporary failures become permanent delivery failures.
+
+#### Partial Failures
+
+For one student, email may succeed, database save may fail, and app push may not execute. For another student, database save may succeed while email fails.
+
+This creates inconsistent delivery and persistence state.
+
+#### High Latency for 50,000 Students
+
+The sender must wait for the entire loop to finish. At campus scale, this creates high latency for administrators and delays delivery to later students in the list.
+
+The last student may receive the notification much later than the first student.
+
+## Failure Scenario
+
+Logs indicate `send_email` failed for 200 students.
+
+### Which Students Received Notifications
+
+Students processed before the failure point may have received:
+
+- Email notification if `send_email` succeeded
+- Database record if `save_to_db` succeeded
+- In-app push if `push_to_app` succeeded
+
+Students whose `send_email` failed may still have inconsistent outcomes depending on the code behavior:
+
+- If the function stops on email failure, those students do not get database records or app pushes.
+- If the function catches the email error and continues, those students may get database records and app pushes but no email.
+
+Students processed after the failed email operations may or may not receive notifications depending on whether the loop continued.
+
+### Which Students Did Not Receive Notifications
+
+The 200 students with failed `send_email` calls did not receive email notifications.
+
+Some of them may also not have received in-app notifications if the function stopped before `push_to_app`.
+
+If the process crashed or exited on the first unhandled exception, all remaining students after that failure point may not have received any notification at all.
+
+### Why System State Becomes Inconsistent
+
+The state becomes inconsistent because persistence and delivery are mixed together without a transaction boundary or durable job tracking.
+
+Possible inconsistent states include:
+
+- Email sent but database save failed.
+- Database save succeeded but email failed.
+- App push sent but email failed.
+- Some students received all delivery channels.
+- Some students received only one delivery channel.
+- Some students received nothing.
+- The system cannot reliably distinguish completed, failed, and pending deliveries.
+
+This makes retries dangerous because retrying the whole function may duplicate notifications for students who already received them.
+
+## Should Email and DB Save Occur Together?
+
+No.
+
+The database should be the source of truth.
+
+Notification persistence must happen before delivery. Delivery systems such as email, push notifications, analytics, and WebSocket fan-out should operate from persisted notification records or durable events.
+
+### Correct Transaction Boundary
+
+The core transaction should include:
+
+- Create the notification record.
+- Create recipient or delivery records if user-specific targeting is required.
+- Commit the database transaction.
+
+After the transaction commits, the system can publish a `NotificationCreated` event or enqueue delivery jobs.
+
+### Why Persistence Comes First
+
+Persisting first ensures:
+
+- The notification has a durable ID.
+- Delivery workers can retry safely.
+- WebSocket clients can resync from the REST API.
+- Failed delivery attempts can be tracked.
+- The system has a reliable source of truth after crashes.
+
+Email and push delivery should not be inside the same database transaction because external systems cannot participate safely in the database transaction. Email providers and push gateways can time out, return partial success, or accept a request and fail later.
+
+## Proposed Architecture
+
+Use an event-driven architecture with durable queues and independent workers.
+
+### Flow
+
+1. Save notification to database.
+2. Publish `NotificationCreated` event.
+3. Push event into a message queue.
+4. Dedicated workers process delivery and side effects:
+   - Email delivery
+   - In-app delivery
+   - Analytics
+
+### Recommended Components
+
+#### PostgreSQL
+
+PostgreSQL stores:
+
+- Notification content
+- Recipient records
+- Read tracking
+- Delivery status
+- Audit metadata
+
+#### Message Queue
+
+Use a queue or event streaming platform such as:
+
+- Kafka
+- RabbitMQ
+- AWS SQS
+
+The queue decouples notification creation from delivery execution.
+
+#### Workers
+
+Dedicated workers consume jobs from the queue.
+
+Worker types can include:
+
+- Email delivery worker
+- Push notification worker
+- WebSocket fan-out worker
+- Analytics worker
+
+Each worker can scale independently based on workload.
+
+### Event Example
+
+```json
+{
+  "event": "NotificationCreated",
+  "eventId": "evt_01HYX8JV4QH3J9Z3R0Q7F7S1AB",
+  "notificationId": "noti_01HYX7K9P4Q8R2M6A5B3C1D0EF",
+  "createdAt": "2026-06-17T09:30:00Z"
+}
+```
+
+### Delivery Job Example
+
+```json
+{
+  "jobId": "job_01HYX91CD6J4BC9X8WMH9B10QN",
+  "notificationId": "noti_01HYX7K9P4Q8R2M6A5B3C1D0EF",
+  "studentId": "1042",
+  "channels": ["email", "push"],
+  "attempt": 1
+}
+```
+
+## Reliability Improvements
+
+### Retry Mechanism
+
+Failed jobs should be retried automatically.
+
+Retryable failures include:
+
+- Network timeouts
+- Email provider throttling
+- Temporary push gateway failures
+- Worker crashes
+
+Non-retryable failures, such as invalid email addresses, should be marked as permanently failed.
+
+### Exponential Backoff
+
+Retries should use exponential backoff to avoid overwhelming external providers.
+
+Example retry schedule:
+
+```text
+Attempt 1: immediate
+Attempt 2: after 30 seconds
+Attempt 3: after 2 minutes
+Attempt 4: after 10 minutes
+Attempt 5: after 30 minutes
+```
+
+### Dead Letter Queue
+
+Jobs that fail after the maximum retry count should be moved to a dead letter queue.
+
+The dead letter queue allows engineers to:
+
+- Inspect failed jobs
+- Reprocess after fixing issues
+- Identify bad data
+- Monitor provider failures
+
+### Idempotency
+
+Workers must be idempotent so retries do not create duplicate deliveries.
+
+Idempotency can be implemented with:
+
+- Unique delivery records per `notification_id`, `student_id`, and `channel`
+- Idempotency keys sent to external providers where supported
+- Delivery status checks before sending
+
+Example uniqueness rule:
+
+```sql
+CREATE UNIQUE INDEX idx_notification_delivery_unique
+ON notification_deliveries(notification_id, user_id, channel);
+```
+
+### Monitoring
+
+The platform should monitor:
+
+- Queue depth
+- Worker processing rate
+- Job retry count
+- Dead letter queue size
+- Email delivery success rate
+- Push delivery success rate
+- End-to-end notification latency
+- Provider error rates
+
+Alerts should be configured for abnormal queue growth, high failure rates, and delayed delivery.
+
+## Revised Pseudocode
+
+### Notification Creation
+
+```text
+function notify_all(student_ids, message):
+    notification_id = save_notification(message)
+
+    for student_id in student_ids:
+        enqueue_notification_job(
+            notification_id,
+            student_id
+        )
+
+    publish_event(
+        "NotificationCreated",
+        notification_id
+    )
+
+    return notification_id
+```
+
+### Worker Processing
+
+```text
+function process_notification(job):
+    try:
+        if delivery_already_completed(
+            job.notification_id,
+            job.student_id
+        ):
+            return
+
+        notification = get_notification(job.notification_id)
+
+        send_email(
+            job.student_id,
+            notification.message
+        )
+
+        send_push(
+            job.student_id,
+            notification.message
+        )
+
+        mark_delivery_status(
+            job.notification_id,
+            job.student_id,
+            "delivered"
+        )
+
+    except RetryableError as error:
+        mark_delivery_status(
+            job.notification_id,
+            job.student_id,
+            "retrying"
+        )
+
+        retry_with_exponential_backoff(job)
+
+    except PermanentError as error:
+        mark_delivery_status(
+            job.notification_id,
+            job.student_id,
+            "failed"
+        )
+
+        send_to_dead_letter_queue(job, error)
+```
+
+### Channel-Specific Worker Option
+
+For better isolation, email and push can be processed by separate workers.
+
+```text
+function process_email_notification(job):
+    try:
+        if email_delivery_already_completed(
+            job.notification_id,
+            job.student_id
+        ):
+            return
+
+        notification = get_notification(job.notification_id)
+        send_email(job.student_id, notification.message)
+        mark_channel_delivery_status(job.notification_id, job.student_id, "email", "delivered")
+
+    except RetryableError as error:
+        retry_with_exponential_backoff(job)
+
+    except PermanentError as error:
+        mark_channel_delivery_status(job.notification_id, job.student_id, "email", "failed")
+        send_to_dead_letter_queue(job, error)
+```
+
+## Benefits
+
+### Better Scalability
+
+Queue-based fan-out allows the platform to process thousands of notification deliveries in parallel across many workers.
+
+### Faster Execution
+
+The API request only needs to persist the notification and enqueue jobs. It does not need to wait for all emails and push notifications to finish.
+
+### Fault Tolerance
+
+If one worker fails, jobs remain in the queue and can be retried by another worker.
+
+### Easier Monitoring
+
+Queues and delivery tables make it easier to track:
+
+- Pending jobs
+- Successful deliveries
+- Failed deliveries
+- Retry counts
+- Provider-specific failures
+
+### Independent Scaling of Workers
+
+Different channels can scale independently.
+
+For example:
+
+- Email workers can scale up during placement drives.
+- WebSocket workers can scale up during result announcements.
+- Analytics workers can run at lower priority.
+
+## Final Recommendation
+
+Use an event-driven architecture for notification delivery.
+
+Recommended stack:
+
+- PostgreSQL as the system of record
+- Redis for caching unread counts and recent notification lists
+- Kafka, RabbitMQ, or AWS SQS for durable asynchronous job processing
+- WebSockets for real-time in-app delivery
+
+The final architecture should follow this sequence:
+
+1. Persist notification data in PostgreSQL.
+2. Commit the transaction.
+3. Publish a `NotificationCreated` event.
+4. Enqueue per-student delivery jobs.
+5. Process delivery through independent workers.
+6. Retry failed jobs with exponential backoff.
+7. Move permanently failed jobs to a dead letter queue.
+8. Track delivery status for observability and safe retries.
+
+This architecture provides strong consistency for notification records, scalable delivery for 50,000 students, reliable retry behavior, and clean separation between notification creation and notification delivery.
