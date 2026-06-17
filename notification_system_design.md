@@ -934,3 +934,508 @@ ws://localhost:8080/api/v1/notifications/ws
 - Timestamps use UTC and ISO 8601 format.
 - WebSocket clients are responsible for reconnecting and using the REST API to resync after disconnection.
 - The API uses JSON only and does not support XML or form-encoded payloads.
+
+# Stage 2
+
+## 1. Database Selection
+
+PostgreSQL is recommended as the primary persistent storage for the Campus Notification Platform.
+
+### Why PostgreSQL
+
+#### Relational Nature of Notification Data
+
+Notification data has clear relational behavior:
+
+- A notification has structured attributes such as title, message, category, priority, and timestamps.
+- A notification can be read by many users.
+- A user can read many notifications.
+- Read tracking is best represented as a separate relational table with foreign key constraints.
+
+This makes PostgreSQL a natural fit because it can model notifications and read receipts using normalized tables and well-defined relationships.
+
+#### ACID Guarantees
+
+PostgreSQL provides ACID guarantees, which are important for correctness in operations such as:
+
+- Creating a notification and making it immediately available for reads.
+- Marking a notification as read exactly once per user.
+- Marking all notifications as read in a consistent transaction.
+- Deleting or expiring notifications without leaving invalid read-tracking records.
+
+These guarantees reduce the risk of inconsistent notification state.
+
+#### Query Flexibility
+
+The Stage 1 APIs require flexible querying by:
+
+- Category
+- Read or unread status
+- Created date
+- Expiration date
+- Priority
+- Pagination order
+
+PostgreSQL supports these access patterns with expressive SQL, joins, filtering, aggregation, and ordering.
+
+#### Indexing Support
+
+PostgreSQL provides strong indexing options, including:
+
+- B-tree indexes for category, timestamps, user IDs, and foreign keys.
+- Composite indexes for common query patterns.
+- Partial indexes for targeted optimization.
+- Index-only scans where query shape allows it.
+
+These indexing features directly support fast filtering, pagination, unread count retrieval, and read-state lookup.
+
+#### Scalability Options
+
+PostgreSQL can scale through:
+
+- Vertical scaling
+- Read replicas
+- Connection pooling
+- Table partitioning
+- Archival tables
+- Caching with Redis
+- Managed cloud PostgreSQL services with automated backups and failover
+
+For a campus notification workload, PostgreSQL provides a strong balance of consistency, query power, and operational maturity.
+
+### Why MongoDB Was Not Chosen as the Primary Database
+
+MongoDB is useful for flexible document storage, but it is not the primary choice for this design because notification read tracking is relational and can grow independently from notification content. Embedding read status inside notification documents would become inefficient as the number of users grows. MongoDB can support references, but PostgreSQL provides stronger relational constraints, transaction semantics, and SQL query flexibility for the required API patterns.
+
+MongoDB could still be considered for secondary use cases such as storing flexible notification templates or analytics events, but PostgreSQL is the better primary database for this platform.
+
+## 2. Database Schema
+
+The schema separates notification content from user read tracking. This keeps notification records compact and allows read status to scale independently.
+
+### notifications
+
+```sql
+CREATE TABLE notifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title VARCHAR(255) NOT NULL,
+  message TEXT NOT NULL,
+  category VARCHAR(30) NOT NULL CHECK (category IN ('Placement', 'Event', 'Result', 'General')),
+  priority VARCHAR(20) NOT NULL CHECK (priority IN ('Low', 'Medium', 'High', 'Urgent')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NULL
+);
+```
+
+### notification_reads
+
+```sql
+CREATE TABLE notification_reads (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  user_id VARCHAR(100) NOT NULL,
+  read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT uq_notification_reads_notification_user UNIQUE (notification_id, user_id)
+);
+```
+
+### Notes
+
+- `gen_random_uuid()` requires the `pgcrypto` extension.
+- `user_id` is stored as `VARCHAR(100)` because authentication is out of scope, but clients still need a stable pre-authorized user identifier for read tracking.
+- `ON DELETE CASCADE` removes related read records when a notification is deleted.
+- The unique constraint prevents duplicate read records for the same notification and user.
+
+## 3. Relationships
+
+One notification can be read by many users.
+
+This relationship is represented by the `notification_reads` table:
+
+- `notifications.id` is the parent notification identifier.
+- `notification_reads.notification_id` references the notification.
+- `notification_reads.user_id` identifies the user who read the notification.
+- `notification_reads.read_at` stores when the notification was read by that user.
+
+This creates a one-to-many relationship from `notifications` to `notification_reads`. It also supports a many-to-many logical relationship between users and notifications, where each user may read many notifications and each notification may be read by many users.
+
+## 4. Indexing Strategy
+
+### Index Statements
+
+```sql
+CREATE INDEX idx_notifications_category
+ON notifications (category);
+
+CREATE INDEX idx_notifications_created_at
+ON notifications (created_at DESC);
+
+CREATE INDEX idx_notifications_expires_at
+ON notifications (expires_at);
+
+CREATE INDEX idx_notification_reads_notification_id
+ON notification_reads (notification_id);
+
+CREATE INDEX idx_notification_reads_user_id
+ON notification_reads (user_id);
+
+CREATE INDEX idx_notification_reads_user_notification
+ON notification_reads (user_id, notification_id);
+
+CREATE INDEX idx_notifications_expires_created_at
+ON notifications (expires_at, created_at DESC);
+```
+
+### Benefits
+
+- `idx_notifications_category` improves category filtering for Placement, Event, Result, and General notifications.
+- `idx_notifications_created_at` improves newest-first notification listing and pagination.
+- `idx_notifications_expires_at` improves expiration cleanup jobs and active notification filtering.
+- `idx_notification_reads_notification_id` improves joins from notifications to read records.
+- `idx_notification_reads_user_id` improves user-specific read-history lookup.
+- `idx_notification_reads_user_notification` improves unread lookup by quickly checking whether a user has read a notification.
+- `idx_notifications_expires_created_at` improves active-notification filtering and ordering by combining expiration and creation timestamps.
+
+### Unread Lookup Optimization
+
+Unread notifications are found by selecting notifications that do not have a matching read record for the current user. The composite index on `(user_id, notification_id)` makes this anti-join efficient.
+
+```sql
+SELECT n.*
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $1
+WHERE nr.id IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > NOW())
+ORDER BY n.created_at DESC;
+```
+
+## 5. Data Growth Challenges
+
+### Large Notification Volume
+
+Over time, the `notifications` table can grow significantly due to placement announcements, event reminders, result updates, and general campus messages. Large tables can increase index size and slow down queries if old records are not archived or partitioned.
+
+### Read Tracking Explosion
+
+Read tracking can grow much faster than notifications. If there are 20,000 users and 10,000 notifications, the potential read-tracking volume can reach hundreds of millions of rows. This makes the `notification_reads` table the primary growth concern.
+
+### Slow Filtering
+
+Filtering by category, priority, active status, and read status may slow down as data grows. Without proper indexes, the database may need to scan large portions of the table.
+
+### Slow Pagination
+
+Offset-based pagination can become slow for deep pages because the database must scan and discard skipped rows. This becomes more expensive as notification history grows.
+
+### Storage Costs
+
+Notification text, indexes, read receipts, backups, and replicas all contribute to storage costs. Read receipts are especially expensive because they grow with both notification count and user count.
+
+## 6. Scalability Solutions
+
+### Indexing
+
+Create indexes that match the API query patterns, especially category filtering, created-time ordering, expiration cleanup, and user-specific read lookup.
+
+### Pagination
+
+Use limit-based pagination for simple API access. For large datasets, prefer cursor-based pagination using `created_at` and `id` as the cursor.
+
+Example cursor condition:
+
+```sql
+WHERE (n.created_at, n.id) < ($1, $2)
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $3;
+```
+
+### Table Partitioning
+
+Partition large tables by time, such as monthly or quarterly partitions on `created_at`. This is especially useful for:
+
+- Archiving old notifications
+- Deleting expired notification ranges
+- Improving query performance on recent notifications
+- Reducing index size per partition
+
+The `notification_reads` table can also be partitioned by hash on `user_id` or by time through the related notification lifecycle.
+
+### Archival Strategy
+
+Move old or expired notifications to archival tables or object storage. Keep only active and recently expired notifications in the primary operational tables.
+
+Archival candidates:
+
+- Notifications expired more than 90 days ago
+- Read records for archived notifications
+- Low-priority historical announcements
+
+### Read Replicas
+
+Use PostgreSQL read replicas for read-heavy endpoints such as:
+
+- List notifications
+- Filter by category
+- Get notification by ID
+- Get unread count
+
+Write operations should continue to use the primary database.
+
+### Caching
+
+Use Redis to cache frequently accessed data:
+
+- Unread counts per user
+- Recent notifications
+- Category-filtered recent notification lists
+
+Cache entries should be invalidated or updated when notifications are created, deleted, expired, or marked as read.
+
+### Database Connection Pooling
+
+Use a connection pooler such as PgBouncer or application-level pooling to avoid exhausting PostgreSQL connections during high-traffic periods.
+
+Connection pooling is especially important when:
+
+- Many API instances are running.
+- WebSocket servers also access the database.
+- Campus-wide announcements trigger request spikes.
+
+## 7. SQL Queries Supporting Stage 1 APIs
+
+The following queries use PostgreSQL syntax and assume the API receives a stable `user_id` for read-status operations.
+
+### Create Notification
+
+```sql
+INSERT INTO notifications (
+  title,
+  message,
+  category,
+  priority,
+  expires_at
+)
+VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  $5
+)
+RETURNING
+  id,
+  title,
+  message,
+  category,
+  priority,
+  created_at,
+  updated_at,
+  expires_at;
+```
+
+### Get Notification By ID
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  n.created_at,
+  n.updated_at,
+  n.expires_at,
+  CASE WHEN nr.id IS NULL THEN false ELSE true END AS is_read
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $2
+WHERE n.id = $1;
+```
+
+### Get Notifications List
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  n.created_at,
+  n.updated_at,
+  n.expires_at,
+  CASE WHEN nr.id IS NULL THEN false ELSE true END AS is_read
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $1
+WHERE (n.expires_at IS NULL OR n.expires_at > NOW())
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $2
+OFFSET $3;
+```
+
+### Filter By Category
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  n.created_at,
+  n.updated_at,
+  n.expires_at,
+  CASE WHEN nr.id IS NULL THEN false ELSE true END AS is_read
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $1
+WHERE n.category = $2
+  AND (n.expires_at IS NULL OR n.expires_at > NOW())
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $3
+OFFSET $4;
+```
+
+### Mark Notification Read
+
+```sql
+INSERT INTO notification_reads (
+  notification_id,
+  user_id,
+  read_at
+)
+VALUES (
+  $1,
+  $2,
+  NOW()
+)
+ON CONFLICT (notification_id, user_id)
+DO UPDATE SET read_at = EXCLUDED.read_at
+RETURNING
+  id,
+  notification_id,
+  user_id,
+  read_at;
+```
+
+### Mark All Notifications Read
+
+```sql
+INSERT INTO notification_reads (
+  notification_id,
+  user_id,
+  read_at
+)
+SELECT
+  n.id,
+  $1,
+  NOW()
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $1
+WHERE nr.id IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > NOW())
+ON CONFLICT (notification_id, user_id)
+DO NOTHING;
+```
+
+To return the number of notifications marked as read:
+
+```sql
+WITH inserted_reads AS (
+  INSERT INTO notification_reads (
+    notification_id,
+    user_id,
+    read_at
+  )
+  SELECT
+    n.id,
+    $1,
+    NOW()
+  FROM notifications n
+  LEFT JOIN notification_reads nr
+    ON nr.notification_id = n.id
+   AND nr.user_id = $1
+  WHERE nr.id IS NULL
+    AND (n.expires_at IS NULL OR n.expires_at > NOW())
+  ON CONFLICT (notification_id, user_id)
+  DO NOTHING
+  RETURNING id
+)
+SELECT COUNT(*) AS updated_count
+FROM inserted_reads;
+```
+
+### Get Unread Count
+
+```sql
+SELECT COUNT(*) AS unread_count
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $1
+WHERE nr.id IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > NOW());
+```
+
+### Delete Notification
+
+```sql
+DELETE FROM notifications
+WHERE id = $1;
+```
+
+To confirm the deleted notification ID:
+
+```sql
+DELETE FROM notifications
+WHERE id = $1
+RETURNING id;
+```
+
+## 8. Future Enhancements
+
+### Redis Caching
+
+Redis can cache unread counts, recent notification lists, and category-filtered views. It can also support lightweight pub/sub for smaller real-time deployments.
+
+### Kafka Event Streaming
+
+Kafka can provide durable event streaming for notification lifecycle events such as:
+
+- `notification.created`
+- `notification.updated`
+- `notification.deleted`
+- `notification.read`
+
+This improves reliability for downstream consumers such as analytics, audit logging, email delivery, push notifications, and WebSocket fan-out services.
+
+### Multi-Region Deployment
+
+For institutions with distributed campuses or strict availability requirements, the platform can evolve toward multi-region deployment using:
+
+- Regional read replicas
+- Global load balancing
+- Region-aware caching
+- Disaster recovery replication
+- Clearly defined primary write region
+
+### Search Indexing
+
+Use a search engine such as OpenSearch, Elasticsearch, or PostgreSQL full-text search for advanced notification discovery.
+
+Search indexing can support:
+
+- Keyword search across title and message
+- Category and priority facets
+- Date-range filtering
+- Relevance ranking
+- Analytics on common search terms
