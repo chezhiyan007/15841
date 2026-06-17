@@ -2597,3 +2597,117 @@ The final architecture should follow this sequence:
 8. Track delivery status for observability and safe retries.
 
 This architecture provides strong consistency for notification records, scalable delivery for 50,000 students, reliable retry behavior, and clean separation between notification creation and notification delivery.
+
+# Stage 6
+
+## Priority Notification Ranking
+
+Stage 6 introduces a Python-based ranking utility that fetches notifications directly from the remote notification API and returns the Top 10 unread notifications using a fixed-size min heap.
+
+The solution does not use a database and does not hardcode notification data. Notifications are read directly from the API response.
+
+## Approach
+
+The utility performs the following steps:
+
+1. Read the Authorization Bearer token from an environment variable.
+2. Fetch notifications from the remote API.
+3. Extract the notification list from the API response.
+4. Ignore notifications that are already read.
+5. Compute a priority score for each unread notification.
+6. Maintain only the Top 10 notifications in a fixed-size min heap.
+7. Print the Top 10 unread notifications in ranked order.
+
+This approach avoids sorting the full dataset and is suitable when the API may return a large number of notifications.
+
+## Scoring Strategy
+
+Priority is based on notification type and recency.
+
+Type weights:
+
+| Notification Type | Weight |
+| --- | --- |
+| Placement | 3 |
+| Result | 2 |
+| Event | 1 |
+
+The combined score is calculated using:
+
+```text
+priority_score = type_weight + recency_score
+```
+
+Where:
+
+```text
+recency_score = 1 / (age_in_hours + 1)
+```
+
+This means:
+
+- Placement notifications receive the highest base priority.
+- Result notifications rank above Event notifications.
+- Newer notifications receive a higher recency score.
+- Older notifications gradually lose recency influence.
+
+## Heap Usage
+
+The implementation uses Python's `heapq` module as a fixed-size min heap of size 10.
+
+For every unread notification:
+
+1. Calculate its priority score.
+2. If the heap has fewer than 10 items, insert the notification.
+3. If the heap already has 10 items, compare the new notification with the smallest item in the heap.
+4. Replace the smallest item only if the new notification has a higher score.
+
+This ensures that the heap always contains the best 10 unread notifications seen so far.
+
+## Complexity Analysis
+
+Let `n` be the number of notifications returned by the API.
+
+Time complexity:
+
+```text
+O(n log 10)
+```
+
+Because the heap size is fixed at 10, each insert or replacement has a bounded cost.
+
+Space complexity:
+
+```text
+O(10)
+```
+
+The ranking structure stores only the Top 10 notifications, excluding the API response object itself.
+
+This is more efficient than sorting all unread notifications, which would require:
+
+```text
+O(n log n)
+```
+
+## Handling Continuously Arriving Notifications
+
+The heap-based approach works well when new notifications continue arriving.
+
+Each new notification can be processed independently:
+
+1. Check whether the notification is unread.
+2. Compute its score.
+3. Compare it against the smallest item in the Top 10 heap.
+4. Insert or replace only when it belongs in the Top 10.
+
+The system does not need to re-sort the entire notification dataset whenever a new notification arrives.
+
+In a production system, the same ranking logic can be applied to:
+
+- API polling results
+- WebSocket `notification.created` events
+- Queue-consumed notification events
+- Cached notification batches from Redis
+
+This keeps ranking efficient even as notification volume grows.
