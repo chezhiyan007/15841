@@ -1439,3 +1439,361 @@ Search indexing can support:
 - Date-range filtering
 - Relevance ranking
 - Analytics on common search terms
+
+# Stage 3
+
+## 1. Query Review
+
+### Query Under Review
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### Accuracy Against the Stage 2 Schema
+
+This query is not accurate for the schema designed in Stage 2.
+
+The Stage 2 schema uses:
+
+- `notifications` for notification content.
+- `notification_reads` for per-user read tracking.
+- Snake case column names such as `created_at`, not camel case names such as `createdAt`.
+- `user_id`, not `studentID`.
+
+In the Stage 2 design, `isRead` is not stored directly in the `notifications` table because read status is user-specific. A notification may be unread for one student and read for another student at the same time.
+
+### Why Storing Read State Directly in Notifications Is Problematic
+
+Storing `student_id` and `is_read` directly in the `notifications` table creates major scalability and data modeling problems:
+
+- It mixes global notification content with user-specific state.
+- It requires duplicating the same notification for every student.
+- With 50,000 students and 5,000,000 notifications, duplication can create extremely large storage and indexing overhead.
+- Updating read status causes writes against notification rows instead of a compact read-tracking table.
+- The same notification can no longer be represented as one canonical record shared across students.
+
+For example, a single placement notification sent to 50,000 students should be stored once in `notifications`, not copied 50,000 times.
+
+### Why notification_reads Is Preferred
+
+The `notification_reads` table is preferred because it normalizes read tracking:
+
+- One notification is stored once.
+- A read record is created only when a student reads the notification.
+- Unread state can be inferred by the absence of a read record.
+- Read tracking scales independently from notification content.
+- The database can enforce uniqueness with `(notification_id, user_id)`.
+
+A normalized unread query should look like this:
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  n.created_at,
+  n.updated_at,
+  n.expires_at
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = '1042'
+WHERE nr.id IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > NOW())
+ORDER BY n.created_at ASC
+LIMIT 50;
+```
+
+## 2. Why the Query Is Slow
+
+The reviewed query can become slow with 50,000 students and 5,000,000 notifications.
+
+### Full Table Scans
+
+If there is no useful index on `studentID`, `isRead`, and `createdAt`, PostgreSQL must scan a large number of rows to find matching unread notifications.
+
+### Large Dataset Size
+
+At 5,000,000 notifications, scanning the table repeatedly is expensive. If the table stores one row per student notification, the effective row count can grow much larger than 5,000,000.
+
+### Filtering on Multiple Columns
+
+The query filters by:
+
+- `studentID`
+- `isRead`
+
+If these columns are not indexed together, the database may still need to inspect many rows after using a single-column index.
+
+### Sorting Overhead
+
+The query sorts by `createdAt ASC`. Without an index that already matches the filter and sort order, PostgreSQL must sort the filtered result set separately.
+
+### SELECT * Inefficiency
+
+`SELECT *` retrieves every column, even when the client only needs a subset. This increases:
+
+- Disk I/O
+- Memory usage
+- Network transfer size
+- Query execution time
+
+### Complexity Estimate
+
+Without indexes, the query can be estimated as:
+
+```text
+O(N log N)
+```
+
+This is because the database may need to scan `N` rows for filtering and then sort the matching rows.
+
+## 3. Recommended Improvements
+
+### Composite Index
+
+For a denormalized table that stores `student_id`, `is_read`, and `created_at` directly in `notifications`, the following composite index would help:
+
+```sql
+CREATE INDEX idx_notifications_student_read_created
+ON notifications(student_id, is_read, created_at);
+```
+
+This index allows the database to:
+
+- Quickly locate notifications for one student.
+- Narrow results to unread notifications.
+- Return rows in `created_at` order with less sorting overhead.
+
+However, this index applies to a denormalized schema. In the normalized Stage 2 schema, the preferred indexes are on `notification_reads(user_id, notification_id)` and `notifications(created_at)`.
+
+### Pagination
+
+Always paginate notification lists.
+
+```sql
+LIMIT 50 OFFSET 0;
+```
+
+For large datasets, cursor-based pagination is preferred:
+
+```sql
+WHERE (n.created_at, n.id) > ($1, $2)
+ORDER BY n.created_at ASC, n.id ASC
+LIMIT 50;
+```
+
+### Select Required Columns Only
+
+Avoid `SELECT *`. Return only the fields needed by the API response.
+
+```sql
+SELECT
+  id,
+  title,
+  category,
+  priority,
+  created_at
+FROM notifications;
+```
+
+### Proper Normalization
+
+Use separate tables for notification content and read tracking:
+
+- `notifications`
+- `notification_reads`
+
+This avoids duplicating notification content for every student and keeps read updates isolated to the read-tracking table.
+
+## 4. Cost Analysis
+
+### Without Index
+
+Without an index, the database may need to scan the full table.
+
+```text
+O(N)
+```
+
+If sorting is also required after filtering, the total cost can approach:
+
+```text
+O(N log N)
+```
+
+This is expensive for 5,000,000 notifications and becomes worse as the table grows.
+
+### With Composite Index
+
+With a composite index such as:
+
+```sql
+CREATE INDEX idx_notifications_student_read_created
+ON notifications(student_id, is_read, created_at);
+```
+
+The lookup cost is closer to:
+
+```text
+O(log N)
+```
+
+The database can use the index tree to jump directly to rows matching the student and read status, then scan the matching range in creation-time order.
+
+### Expected Improvements
+
+Expected improvements include:
+
+- Lower query latency.
+- Less sorting work.
+- Fewer scanned rows.
+- Lower CPU usage.
+- Lower memory usage.
+- Better performance during peak notification traffic.
+
+## 5. Should We Index Every Column?
+
+No. Every column should not be indexed.
+
+Indexes improve read performance for specific query patterns, but they also introduce costs.
+
+### Increased Write Cost
+
+Every insert, update, or delete must also update related indexes. More indexes mean slower writes.
+
+### Storage Overhead
+
+Indexes consume disk space. On large tables, index storage can become significant.
+
+### Slower Inserts and Updates
+
+When a notification is created or read status changes, PostgreSQL must maintain each affected index. Too many indexes can slow down write-heavy operations.
+
+### Index Maintenance Cost
+
+Indexes require vacuuming, analysis, memory, and operational monitoring. Unused indexes add maintenance overhead without improving application performance.
+
+Indexes should be added only for columns frequently used in:
+
+- Filtering
+- Joins
+- Sorting
+- Grouping
+- Uniqueness checks
+
+## 6. Recommended Index Strategy
+
+The following examples are useful for a denormalized notification table that contains student-specific notification rows.
+
+### Notification Type Index
+
+```sql
+CREATE INDEX idx_notification_type
+ON notifications(notification_type);
+```
+
+Purpose:
+
+- Improves filtering by notification type, such as Placement, Event, Result, or General.
+- Supports category-specific screens and reports.
+
+### Created At Index
+
+```sql
+CREATE INDEX idx_created_at
+ON notifications(created_at);
+```
+
+Purpose:
+
+- Improves chronological ordering.
+- Supports recent notification lookup.
+- Helps range queries such as notifications created in the last 7 days.
+
+### Student Read Created Composite Index
+
+```sql
+CREATE INDEX idx_student_read_created
+ON notifications(student_id, is_read, created_at);
+```
+
+Purpose:
+
+- Improves unread notification lookup for a specific student.
+- Supports ordering by creation time.
+- Reduces filtering and sorting work for student notification feeds.
+
+### Normalized Schema Index Recommendation
+
+For the Stage 2 normalized schema, prefer these indexes:
+
+```sql
+CREATE INDEX idx_notifications_category_created
+ON notifications(category, created_at DESC);
+
+CREATE INDEX idx_notifications_created_at_id
+ON notifications(created_at DESC, id DESC);
+
+CREATE INDEX idx_notification_reads_user_notification
+ON notification_reads(user_id, notification_id);
+
+CREATE INDEX idx_notification_reads_notification_user
+ON notification_reads(notification_id, user_id);
+```
+
+Purpose:
+
+- `idx_notifications_category_created` supports category filtering with recent-first ordering.
+- `idx_notifications_created_at_id` supports stable pagination.
+- `idx_notification_reads_user_notification` supports unread lookup for a user.
+- `idx_notification_reads_notification_user` supports joins and read-status checks by notification.
+
+## 7. Query to Find Students Who Received Placement Notifications in Last 7 Days
+
+For a denormalized table where `notifications` contains `student_id` and `notification_type`:
+
+```sql
+SELECT DISTINCT student_id
+FROM notifications
+WHERE notification_type = 'Placement'
+  AND created_at >= NOW() - INTERVAL '7 days';
+```
+
+This query returns the unique students who received Placement notifications during the last 7 days.
+
+It works by:
+
+- Filtering notifications to `notification_type = 'Placement'`.
+- Restricting results to notifications created in the last 7 days.
+- Using `DISTINCT` to return each student only once.
+
+For the Stage 2 normalized schema, where notifications are shared globally and user targeting is not yet modeled, this query requires a separate delivery or targeting table. A future schema could include `notification_recipients`:
+
+```sql
+SELECT DISTINCT nr.user_id AS student_id
+FROM notification_recipients nr
+JOIN notifications n
+  ON n.id = nr.notification_id
+WHERE n.category = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+```
+
+## 8. Final Recommendation
+
+For a system with 50,000 students and 5,000,000 notifications:
+
+- Normalize read tracking using `notification_reads`.
+- Avoid storing `is_read` directly on global notification records.
+- Use targeted indexes based on real query patterns.
+- Do not index every column.
+- Use pagination for all list endpoints.
+- Prefer cursor-based pagination for large datasets.
+- Select only required columns instead of using `SELECT *`.
+- Monitor query plans with `EXPLAIN ANALYZE`.
+- Review slow query logs regularly and adjust indexes based on observed workload.
