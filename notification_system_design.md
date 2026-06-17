@@ -1797,3 +1797,372 @@ For a system with 50,000 students and 5,000,000 notifications:
 - Select only required columns instead of using `SELECT *`.
 - Monitor query plans with `EXPLAIN ANALYZE`.
 - Review slow query logs regularly and adjust indexes based on observed workload.
+
+# Stage 4
+
+## Problem Statement
+
+Currently, notifications are fetched from the database on every page load for every student.
+
+This causes:
+
+- Excessive database load
+- Increased response times
+- Poor user experience
+- Reduced scalability
+
+For a platform serving 50,000 students and millions of notifications, direct database reads on every page load can quickly become a bottleneck. The system needs a layered architecture that reduces repeated database access, limits payload size, supports real-time updates, and keeps historical data from slowing down active queries.
+
+## Strategy 1: Redis Caching
+
+Redis should be used to store frequently accessed notification data in memory.
+
+Recommended cached data includes:
+
+- Recent notification lists
+- Category-filtered notification lists
+- Unread notification counts
+- Frequently accessed notification details
+
+### Cache-Aside Pattern
+
+The cache-aside pattern is recommended because it keeps the application in control of cache population and invalidation.
+
+Flow:
+
+1. Check Redis.
+2. If cache hit, return data.
+3. If cache miss, query database.
+4. Store result in Redis.
+5. Return data to the client.
+
+Example cache keys:
+
+```text
+notifications:recent:page:1:limit:20
+notifications:category:Placement:page:1:limit:20
+notifications:unread-count:user:1042
+notification:noti_01HYX7K9P4Q8R2M6A5B3C1D0EF
+```
+
+### Benefits
+
+- Sub-millisecond access for cached data
+- Reduced database traffic
+- Lower response latency
+- Better handling of traffic spikes
+- Lower database CPU and I/O pressure
+
+### Tradeoffs
+
+- Additional infrastructure
+- Cache invalidation complexity
+- Potential stale data
+- More operational monitoring
+- Memory sizing and eviction policy decisions
+
+### Invalidation Approach
+
+Cache entries should be invalidated or refreshed when:
+
+- A notification is created
+- A notification is updated
+- A notification is deleted
+- A student marks a notification as read
+- A student marks all notifications as read
+- A notification expires
+
+Unread count caches should be user-specific and should use short TTLs or event-based invalidation.
+
+## Strategy 2: Real-Time Notifications via WebSockets
+
+WebSockets should be used to push notification changes to connected clients instead of forcing clients to poll or reload all notifications on every page load.
+
+When a new notification is created, the backend publishes a real-time event to connected clients. The frontend can update its local notification list immediately without making a full list request.
+
+### Benefits
+
+- Instant updates
+- Fewer database requests
+- Better user experience
+- Reduced polling traffic
+- Efficient delivery for urgent notifications
+
+### Tradeoffs
+
+- Persistent connections
+- More server memory usage
+- Reconnection handling required
+- Load balancing needs sticky sessions or shared pub/sub coordination
+- Delivery recovery still requires REST sync after reconnect
+
+### Recommended Flow
+
+1. Client loads the first page of notifications through the REST API.
+2. Client opens a WebSocket connection.
+3. Server pushes `notification.created`, `notification.updated`, and `notification.deleted` events.
+4. Client updates local state from WebSocket events.
+5. If the connection drops, the client reconnects.
+6. After reconnecting, the client calls the REST API to resync missed notifications.
+
+## Strategy 3: Pagination
+
+The API should never load all notifications at once.
+
+Use paginated requests:
+
+```http
+GET /api/v1/notifications?page=1&limit=20
+```
+
+For very large datasets, cursor-based pagination is preferred over deep offset pagination:
+
+```http
+GET /api/v1/notifications?limit=20&cursor=2026-06-17T09:30:00Z:noti_01HYX7K9P4Q8R2M6A5B3C1D0EF
+```
+
+### Benefits
+
+- Smaller payloads
+- Faster queries
+- Lower memory consumption
+- Better frontend rendering performance
+- Lower network transfer
+
+### Tradeoffs
+
+- More API calls
+- Slightly more frontend complexity
+- Cursor-based pagination requires stable sorting
+- Total count queries may become expensive at scale
+
+### Recommendation
+
+Use page-based pagination for simple lists and cursor-based pagination for large-scale production feeds.
+
+## Strategy 4: Read Replicas
+
+PostgreSQL read replicas should be used to scale notification retrieval.
+
+The primary database handles writes:
+
+- Create notification
+- Mark notification as read
+- Mark all notifications as read
+- Delete notification
+
+Read replicas handle read-heavy operations:
+
+- List notifications
+- Get notification by ID
+- Filter notifications by category
+- Get unread notification count
+
+### Benefits
+
+- Distributes load
+- Improves read scalability
+- Reduces pressure on the primary database
+- Improves availability for read operations
+
+### Tradeoffs
+
+- Replication lag
+- Additional infrastructure costs
+- More operational complexity
+- Read-after-write consistency needs careful handling
+
+### Consistency Recommendation
+
+For operations where immediate consistency matters, such as showing a notification as read immediately after a student marks it read, the API can temporarily read from the primary database or update the frontend state optimistically.
+
+## Strategy 5: Database Partitioning
+
+Partitioning can reduce the amount of data scanned by queries and make large tables easier to manage.
+
+Notifications can be partitioned by:
+
+- Creation date
+- Student ID
+
+### Partition by Creation Date
+
+Time-based partitioning is recommended for the `notifications` table.
+
+Examples:
+
+- Monthly partitions
+- Quarterly partitions
+- Yearly partitions
+
+This works well because notification queries usually focus on recent data and archival policies are time-based.
+
+### Partition by Student ID
+
+Student-based partitioning can be considered for high-volume user-specific tables such as read receipts or future recipient tables.
+
+This can help distribute read-tracking records across partitions.
+
+### Benefits
+
+- Faster scans
+- Better query performance
+- Smaller indexes per partition
+- Easier archival and deletion of old data
+- Improved maintenance operations
+
+### Tradeoffs
+
+- More complex maintenance
+- Harder migrations
+- Partition key must match query patterns
+- Poor partition design can reduce benefits
+- Application and migration logic may become more complex
+
+## Strategy 6: Archival Strategy
+
+Old notifications should be moved out of active operational tables.
+
+For example, notifications older than 1 year can be moved to archive tables:
+
+```text
+notifications_archive
+notification_reads_archive
+```
+
+### Archival Flow
+
+1. Identify notifications older than the retention threshold.
+2. Copy old notifications and related read records to archive tables or cold storage.
+3. Verify archived data integrity.
+4. Delete archived records from active tables.
+5. Vacuum and analyze active tables.
+
+### Benefits
+
+- Smaller active dataset
+- Faster queries
+- Lower active index size
+- Reduced backup size for hot operational data
+- Better database maintenance performance
+
+### Tradeoffs
+
+- Additional archive management
+- Historical retrieval becomes more complex
+- Archive search may require separate APIs
+- Compliance and retention policies must be clearly defined
+
+### Recommendation
+
+Keep recent and active notifications in primary tables. Move old or expired notifications to archive storage through scheduled background jobs.
+
+## Strategy 7: Efficient API Design
+
+The API should be designed to minimize unnecessary database work and network transfer.
+
+Recommended practices:
+
+- Fetch only required fields.
+- Avoid `SELECT *`.
+- Support filtering.
+- Use proper indexes.
+- Use pagination on all list endpoints.
+- Support category and read-status filters.
+- Avoid expensive total counts on every request unless needed.
+
+Example:
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.category,
+  n.priority,
+  n.created_at,
+  CASE WHEN nr.id IS NULL THEN false ELSE true END AS is_read
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id
+ AND nr.user_id = $1
+WHERE (n.expires_at IS NULL OR n.expires_at > NOW())
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $2;
+```
+
+### Benefits
+
+- Lower network transfer
+- Faster execution
+- Lower memory usage
+- Better cache efficiency
+- More predictable API performance
+
+### Tradeoffs
+
+- More API design effort
+- More endpoint-specific query design
+- Frontend must request the correct shape of data
+- Backend must maintain clear response contracts
+
+## Recommended Architecture
+
+The recommended architecture combines multiple strategies rather than relying on a single optimization.
+
+### 1. PostgreSQL as Primary Database
+
+PostgreSQL remains the primary source of truth for notifications and read tracking.
+
+It provides:
+
+- Strong consistency
+- Relational modeling
+- ACID transactions
+- Mature indexing
+- Read replica support
+- Partitioning support
+
+### 2. Redis for Caching
+
+Redis should be used for high-frequency reads such as recent notification lists and unread counts.
+
+This reduces repeated database reads and improves response times for common page loads.
+
+### 3. WebSockets for Real-Time Delivery
+
+WebSockets should push new and changed notifications to clients instantly.
+
+This reduces polling and avoids unnecessary full notification reloads.
+
+### 4. Pagination for Notification Listing
+
+All notification list endpoints should use pagination.
+
+Pagination keeps payloads small and prevents large memory usage in both the backend and frontend.
+
+### 5. Read Replicas for Scaling Reads
+
+Read replicas should serve read-heavy notification endpoints.
+
+This protects the primary database so it can focus on writes and transactional correctness.
+
+### 6. Archival for Historical Data
+
+Old notifications and read records should be archived after a defined retention period.
+
+This keeps active tables smaller, improves index performance, and reduces operational cost.
+
+### Final Architecture Summary
+
+This combination provides the best balance of performance, scalability, cost, and maintainability:
+
+- PostgreSQL provides reliable persistent storage.
+- Redis reduces repeated database reads.
+- WebSockets deliver instant updates and reduce polling.
+- Pagination limits payload and query size.
+- Read replicas distribute read traffic.
+- Partitioning improves large-table performance.
+- Archival keeps the active dataset manageable.
+- Efficient API design prevents unnecessary database and network work.
+
+Together, these strategies allow the notification platform to support 50,000 students and millions of notifications while maintaining fast response times and predictable operational behavior.
